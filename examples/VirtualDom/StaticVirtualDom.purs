@@ -1,42 +1,23 @@
 module Examples.VirtualDom.StaticVirtualDom where
 
-import Elm.VirtualDom
+import Elm.Default
 
+import Control.Monad.Aff (launchAff_)
 import Control.Monad.Eff (Eff)
-import Control.Monad.Eff.Exception (EXCEPTION)
-import DOM (DOM)
-import DOM.HTML (window)
-import DOM.HTML.Types (htmlDocumentToNonElementParentNode, htmlDocumentToDocument)
-import DOM.HTML.Window (document)
-import DOM.Node.Node (appendChild)
-import DOM.Node.NonElementParentNode (getElementById)
-import DOM.Node.Types (elementToNode, ElementId(..))
-import DOM.Renderable (render)
-import Data.Foldable (for_)
-import Data.List (List(..), (:))
-import Graphics.Canvas (CANVAS)
-import Prelude (bind, Unit, (>>=))
+import Control.Monad.IO (runIO)
+import Control.Monad.IO.Effect (INFINITY)
+import Elm.Platform (runProgram)
+import Elm.VirtualDom (program, text)
+import Prelude (Unit, unit, ($))
 
 
-main :: Eff (canvas :: CANVAS, dom :: DOM, err :: EXCEPTION) Unit
-main = do
-    doc <-
-        window >>= document
-
-    nullableContainer <-
-        getElementById (ElementId "contents") (htmlDocumentToNonElementParentNode doc)
-
-    for_ nullableContainer \container -> do
-        element <- render (htmlDocumentToDocument doc) scene
-        appendChild element (elementToNode container)
-
-
-scene :: ∀ msg. Node msg
-scene =
-    node "p"
-        Nil
-        ( text "Hello World!"
-        : Nil
-        )
-
-
+main :: Eff (infinity :: INFINITY) Unit
+main =
+    launchAff_ $ runIO do
+        runProgram unit $
+            program
+                { init : unit /\ none
+                , update : \msg model -> model /\ none
+                , subscriptions : \model -> none
+                , view : \model -> text "Hello World"
+                }
