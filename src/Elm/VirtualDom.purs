@@ -12,67 +12,64 @@ module Elm.VirtualDom
     , lazy, lazy_, lazy2, lazy2_, lazy3, lazy3_
     , keyedNode
     , program, programWithFlags
+    , RenderedNode, render, update
+    , RenderAt, replaceNode, appendChildTo
     ) where
 
 
+import Control.Alt ((<|>))
 import Control.Apply (lift2)
 import Control.Comonad (extract)
-import Control.Monad (when, unless, (>=>))
+import Control.Monad (unless, when)
 import Control.Monad.Aff (forkAff)
 import Control.Monad.Aff.AVar (AVar, makeEmptyVar, takeVar)
 import Control.Monad.Aff.Class (liftAff)
-import Control.Monad.Eff (forE, runPure)
-import Control.Monad.Eff.AVar (putVar)
 import Control.Monad.Eff.Class (liftEff)
+import Control.Monad.Eff.Ref (REF, Ref, modifyRef, newRef, readRef, writeRef)
 import Control.Monad.Except (runExcept)
 import Control.Monad.Except.Trans (runExceptT, throwError)
 import Control.Monad.IO (IO, runIO')
-import Control.Monad.IOSync (IOSync)
-import Control.Monad.IOSync.Class (liftIOSync)
-import Control.Monad.Maybe.Trans (MaybeT(..), runMaybeT)
-import Control.Monad.Rec.Class (Step(..), tailRecM, tailRecM2)
+import Control.Monad.IO.Effect (INFINITY)
+import Control.Monad.IOSync (IOSync, runIOSync')
 import Control.Monad.ST (pureST, newSTRef, writeSTRef, readSTRef)
-import DOM.Event.Event (currentTarget, preventDefault, stopPropagation)
-import DOM.Event.EventTarget (addEventListener, dispatchEvent, eventListener)
-import DOM.Event.Types (CustomEvent, Event, EventTarget, EventType, customEventToEvent, readCustomEvent, readEventTarget)
+import DOM (DOM)
+import DOM.Event.Event (preventDefault, stopPropagation)
+import DOM.Event.EventTarget (EventListener, addEventListener, eventListener)
+import DOM.Event.Types (Event, EventType(EventType))
 import DOM.HTML (window)
-import DOM.HTML.Document (body)
-import DOM.HTML.Types (htmlDocumentToDocument, htmlElementToEventTarget, htmlElementToNode)
 import DOM.HTML.Window (document)
 import DOM.Node.Document (createTextNode, createElement, createElementNS)
-import DOM.Node.Element (setAttribute, removeAttribute)
-import DOM.Node.Node (appendChild, childNodes, lastChild, nextSibling, nodeType, ownerDocument, parentNode, previousSibling, removeChild, replaceChild, setTextContent)
-import DOM.Node.NodeList (item)
+import DOM.Node.Element (setAttribute)
+import DOM.Node.Node (appendChild, nodeType, ownerDocument, parentNode, replaceChild, setTextContent)
 import DOM.Node.NodeType (NodeType(..))
 import DOM.Node.Types (Document, Element, elementToEventTarget, elementToNode, textToNode)
 import DOM.Node.Types (Node) as DOM
-import Data.Array (null) as Array
-import Data.Array.ST (runSTArray, emptySTArray, pushSTArray)
+import Data.Bifunctor (lmap)
 import Data.Coyoneda (Coyoneda, coyoneda, unCoyoneda)
-import Data.Either (Either(..), either, hush)
+import Data.Either (Either(Right, Left), either)
 import Data.Exists (Exists, mkExists, runExists)
-import Data.Foldable (class Foldable, foldl, for_)
+import Data.Foldable (class Foldable, for_, traverse_)
+import Data.FoldableWithIndex (forWithIndex_, traverseWithIndex_)
 import Data.Foreign (Foreign, ForeignError(..), readString, toForeign)
 import Data.Lazy (Lazy, defer, force)
 import Data.Leibniz (type (~), Leibniz(..))
-import Data.List (List(..), drop, fromFoldable, length, reverse, singleton, snoc, zip)
-import Data.List (foldM, null) as List
+import Data.List (List, fromFoldable)
 import Data.Maybe (Maybe(Nothing, Just), fromMaybe, maybe)
-import Data.Newtype (unwrap, wrap)
-import Data.Nullable (Nullable, toMaybe)
-import Data.Ord (abs, max)
-import Data.StrMap (StrMap, foldM, foldMap, lookup, isEmpty)
-import Data.StrMap (delete, empty, insert, lookup) as StrMap
+import Data.Newtype (wrap)
+import Data.Nullable (Nullable)
+import Data.StrMap (StrMap, foldM)
 import Data.StrMap.ST (new, poke, peek)
 import Data.StrMap.ST.Unsafe (unsafeFreeze)
-import Data.Tuple (Tuple(Tuple))
+import Data.Traversable (for)
+import Data.TraversableWithIndex (forWithIndex)
+import Data.Tuple (Tuple(Tuple), fst)
 import Data.Tuple.Nested ((/\), type (/\))
 import Elm.Basics (Bool)
-import Elm.Json.Decode (Decoder, Value, decodeValue, equalDecodersL)
+import Elm.Json.Decode (Decoder, Value, decodeValue)
 import Elm.Platform (Cmd, Program, Sub)
 import Elm.Result (Result(..))
 import Partial.Unsafe (unsafeCrashWith, unsafePartial)
-import Prelude (class Eq, class Functor, class Show, Unit, bind, const, discard, eq, flip, id, map, not, pure, show, unit, void, (#), ($), (&&), (*), (+), (-), (/=), (<), (<#>), (<$>), (<<<), (<>), (==), (>), (>>=), (>>>), (||))
+import Prelude (class Eq, class Functor, Unit, bind, const, discard, eq, flip, id, map, pure, unit, void, (#), ($), (&&), (<#>), (<$>), (<<<), (<>), (==), (>>=), (||))
 import Prelude (map) as Virtual
 import Unsafe.Coerce (unsafeCoerce)
 import Unsafe.Reference (reallyUnsafeRefEq, unsafeRefEq)
@@ -99,10 +96,10 @@ runExists3 = unsafeCoerce
 
 -- | > An immutable chunk of data representing a DOM node. This can be HTML or SVG.
 data Node msg
-    = Text String
+    = KeyedNode (NodeRecord msg) (List (String /\ Node msg))
     | PlainNode (NodeRecord msg) (List (Node msg))
-    | KeyedNode (NodeRecord msg) (List (Tuple String (Node msg)))
     | Tagger (Coyoneda Node msg)
+    | Text String
     | Thunk (Lazy (Node msg)) (Thunk msg)
     | Thunk2 (Lazy (Node msg)) (Thunk2 msg)
     | Thunk3 (Lazy (Node msg)) (Thunk3 msg)
@@ -119,39 +116,131 @@ type NodeRecord msg =
     }
 
 
--- Try to determine whether two taggers are equal ... as best we can. We return
--- `Nothing` in cases where we can't be sure whether they are equal or not, given
--- the limits of reference equality for functions. Note that we don't check the
--- final subnode ... this just checks the taggers.
-equalTaggers :: ∀ msg1 msg2. Coyoneda Node msg1 -> Coyoneda Node msg2 -> Maybe Bool
-equalTaggers coyo1 coyo2 =
-    coyo1 # unCoyoneda \func1 subNode1 ->
-    coyo2 # unCoyoneda \func2 subNode2 ->
-        case subNode1, subNode2 of
-            Tagger subcoyo1, Tagger subcoyo2 ->
-                -- They both have another layer of tagger, so check reference
-                -- equality and recurse. (The recursion may give us a `Just`
-                -- or a `Nothing`, so we carry that through).
-                equalTaggers subcoyo1 subcoyo2
-                    <#> (&&) (reallyUnsafeRefEq func1 func2)
+data EventNode msg parent
+    = SubEventNode (msg -> parent) (EventNodeRef parent)
+    | RootEventNode (msg -> IOSync Unit)
 
-            Tagger subcoyo1, _ ->
-                -- There's an extra tagger on the left, so we're definitely
-                -- not equal
-                Just false
 
-            _, Tagger subcoyo2 ->
-                -- There's an extra tagger on the right, so we're definitely
-                -- not equal
-                Just false
+type EventNodeRef msg =
+    Ref (Exists (EventNode msg))
 
-            _, _ ->
-                -- We've reached the end of the taggers on both sides, so we're
-                -- either definitely equal or we can't tell.
-                if reallyUnsafeRefEq func1 func2 then
-                    Just true
-                else
-                    Nothing
+
+runEventNode :: ∀ msg. msg -> EventNodeRef msg -> IOSync Unit
+runEventNode msg eventNodeRef =
+    liftEff (readRef eventNodeRef) >>=
+        runExists
+            case _ of
+                RootEventNode func ->
+                    func msg
+
+                SubEventNode func parent ->
+                    runEventNode (func msg) parent
+
+
+-- Hmm. We're forgetting the parent type, of course, so this is a bit tricky.
+-- Another way in which future iterations on the whole scheme will be valuable!
+parentEventNode :: ∀ msg parentMsg. EventNodeRef msg -> IOSync (EventNodeRef parentMsg)
+parentEventNode eventNodeRef =
+    liftEff (readRef eventNodeRef) >>=
+        runExists
+            case _ of
+                RootEventNode func ->
+                    pure $ unsafeCoerce eventNodeRef
+
+                SubEventNode func parent ->
+                    pure $ unsafeCoerce parent
+
+
+-- | A type which represents the result of rendering a virtual node into a DOM
+-- | node. You originally produce this type by calling `render`. Then, you can
+-- | update it by calling `update` with a new virtual node.
+-- |
+-- | This is not part of the Elm API, and you do not need to use it directly
+-- | when setting up an ordinary Elm `program` -- it is handled for you in that
+-- | case.
+newtype RenderedNode msg =
+    RenderedNode (Ref (RenderedNodeF msg))
+
+
+-- This is wrapped in a `Ref` by `RenderedNode` because (a) producing one of
+-- these is necessarily effectful anyway, since we're including references to
+-- the DOM nodes that we create in doing so; and (b) using this to update the
+-- DOM with a new virtual node is necessarily effectful with respect to the
+-- data structure itself, since the updated DOM will no longer be in sync with
+-- the **old** `RenderedNode` structures. So, we need the ability to actually
+-- **mutate** references to a rendered node which are held externally. And,
+-- that's what wrapping this in a `Ref` gives us.
+--
+-- It also makes the `update` process more efficient, since we don't have to
+-- rebuild the structure as we go in order to make changes lower down ... the
+-- children can actually be mutated without touching the parents, in cases
+-- where the only change needed is deep in the structure.
+data RenderedNodeF msg
+    = RKeyedNode (NodeRecord msg) (RenderedNodeRecord msg) (List (String /\ RenderedNode msg))
+    | RPlainNode (NodeRecord msg) (RenderedNodeRecord msg) (List (RenderedNode msg))
+    | RTagger (Coyoneda RenderedNode msg) (EventNodeRef msg)
+    | RText String DOM.Node (EventNodeRef msg)
+    | RThunk (RenderedNode msg) (Thunk msg)
+    | RThunk2 (RenderedNode msg) (Thunk2 msg)
+    | RThunk3 (RenderedNode msg) (Thunk3 msg)
+
+
+-- So, if we encounter a rendered node as we diff and we need to redraw, where
+-- should we attach the results? That is, what existing node should we replace
+-- when we redraw? For some kinds of rendered node, this is trivial, but for
+-- others it requires a bit of computation.
+redrawAt :: ∀ msg. RenderedNode msg -> IOSync (DOM.Node /\ EventNodeRef msg)
+redrawAt (RenderedNode rNode) =
+    (liftEff $ readRef rNode) >>=
+        case _ of
+            RKeyedNode _ rendered _ ->
+                pure $ elementToNode rendered.element /\ rendered.eventNode
+
+            RPlainNode _ rendered _ ->
+                pure $ elementToNode rendered.element /\ rendered.eventNode
+
+            RTagger coyo eventNode ->
+                coyo # unCoyoneda \_ subNode -> do
+                    loc <-
+                        fst <$> redrawAt subNode
+
+                    -- If we're redrawing where a tagger was, we don't want the
+                    -- eventNode created for the tagger ... we want its parent
+                    -- instead.
+                    parent <-
+                        parentEventNode eventNode
+
+                    pure $ loc /\ parent
+
+            RText _ domNode eventNode ->
+                pure $ domNode /\ eventNode
+
+            RThunk subNode _ ->
+                redrawAt subNode
+
+            RThunk2 subNode _ ->
+                redrawAt subNode
+
+            RThunk3 subNode _ ->
+                redrawAt subNode
+
+
+-- For PlainNode and KeyedNode, this is the extra information we have once
+-- we've rendered the node.
+type RenderedNodeRecord msg =
+    { handlers :: StrMap (Listener /\ Ref (HandlerInfo msg))
+    , element :: Element
+    , eventNode :: EventNodeRef msg
+    }
+
+
+-- The type of our listeners.
+type Listener =
+    EventListener
+        ( infinity :: INFINITY
+        , dom :: DOM
+        , ref :: REF
+        )
 
 
 type Thunk msg = Exists (ThunkRecord1 msg)
@@ -230,15 +319,8 @@ equalThunks3 left right =
 -- | sufficient evidence to have done that.
 equalArgs :: ∀ a. Tuple a (Maybe (a -> a -> Bool)) -> Tuple a (Maybe (a -> a -> Bool)) -> Bool
 equalArgs (Tuple left leftEq) (Tuple right rightEq) =
-    case left, leftEq, right, rightEq of
-        a, Just equals, b, _ ->
-            unsafeRefEq a b || equals a b
-
-        a, _, b, Just equals ->
-            unsafeRefEq a b || equals a b
-
-        a, _, b, _ ->
-            unsafeRefEq a b
+    unsafeRefEq left right ||
+    fromMaybe (\a b -> false) (leftEq <|> rightEq) left right
 
 
 -- | > Create a DOM node with a tag name, a list of HTML properties that can
@@ -315,6 +397,9 @@ text = Text
 -- | > corresponding property. Sometimes changing an attribute does not change the
 -- | > underlying property. For example, as of this writing, the `webkit-playsinline`
 -- | > attribute can be used in HTML, but there is no corresponding property!
+--
+-- The `Styles` constrcutor uses continuation passing so that we can capture
+-- the `Foldable` instance.
 data Property msg
     = CustomProperty Key Value
     | Attribute Key String
@@ -353,7 +438,6 @@ mapProperty :: ∀ a b. (a -> b) -> Property a -> Property b
 mapProperty = map
 
 
-
 -- This represents the properties that should be applied to a node, organized for
 -- quick lookup (since the API supplies them as a list).
 type OrganizedFacts msg =
@@ -365,34 +449,16 @@ type OrganizedFacts msg =
     }
 
 
-data FactChange msg
-    = AddAttribute String String
-    | RemoveAttribute String
-    | AddAttributeNS String String String
-    | RemoveAttributeNS String String
-    | AddEvent EventType Options (Decoder msg)
-    | MutateEvent EventType Options (Decoder msg)
-    | RemoveEvent EventType Options
-    | AddStyle String String
-    | RemoveStyle String
-    | RemoveAllStyles
-    | AddProperty String Value
-    | RemoveProperty String
-
-
 type Namespace = String
 type Key = String
 
 
--- Basically, this seems to take a list of properties and group
--- them according to their subtypes. Also, if properties of the
--- same subtype have the same key, it would only retain one of
--- the properties.
+-- Basically, this seems to take a list of properties and group them according
+-- to their subtypes. Also, if properties of the same subtype have the same
+-- key, it would only retain one of the properties.
 --
--- One alternative would be a foldl, with the OrganizedFacts as
--- the memo. But that might be more inefficient. I should
--- profile the overall code sometime and see where optimizations
--- might be wise.
+-- One alternative would be a foldl, with the OrganizedFacts as the memo. Or,
+-- possibly some kind of Writer monad?
 organizeFacts :: ∀ f msg. Foldable f => f (Property msg) -> {namespace :: Maybe String, facts :: OrganizedFacts msg}
 organizeFacts factList =
     pureST do
@@ -712,524 +778,330 @@ lazy3_ func arg1 arg2 arg3 =
 
 -- RENDER
 
-
--- | If we have consecutive taggers, compose them together. We don't do this up
--- | front, because we want to be able to use `unsafeRefEq` on the functions,
--- | which won't work after we compose them. But it's handy sometimes, because
--- | we don't write out a distinct DOM node for each consecutive tagger.
-composeTaggers :: ∀ msg. Coyoneda Node msg -> Coyoneda Node msg
-composeTaggers coyo =
-    coyo # unCoyoneda \func subNode ->
-        case subNode of
-            Tagger subcoyo ->
-                composeTaggers (func <$> subcoyo)
-
-            _ ->
-                coyo
+-- The liberal use of `Ref` here could possibly be reduced via some kind of
+-- use of soemthing like a State monad. I suppose it would be `render` that
+-- would create some kind of context in which `update` would run? In any event,
+-- I'll explore that later.
+--
+-- The complication is that we're setting up things which the event listeners
+-- will need to access, and which (for performance reasons) we'd like to modify
+-- without modifying the event listeners. So, it may be that we can do no better
+-- than `Ref` at least for parts of this.
 
 
-render :: ∀ msg. Document -> Node msg -> IOSync DOM.Node
-render doc vNode =
+-- | Indicates where a virtual Node should be rendered in the document.
+data RenderAt
+    = ReplaceNode DOM.Node
+    | AppendChildTo DOM.Node
+
+
+-- | Render a virtual node by replacing the indicated Node in the DOM.
+replaceNode :: DOM.Node -> RenderAt
+replaceNode = ReplaceNode
+
+
+-- | Render a virtual node by appending a new child to the indicated node in
+-- | the DOM..
+appendChildTo :: DOM.Node -> RenderAt
+appendChildTo = AppendChildTo
+
+
+renderInDocument :: RenderAt -> IOSync Document
+renderInDocument location =
+    case location of
+        ReplaceNode n ->
+            documentForNode n
+
+        AppendChildTo n ->
+            documentForNode n
+
+
+renderAt :: RenderAt -> DOM.Node -> IOSync Unit
+renderAt location domNode = liftEff
+    case location of
+        AppendChildTo parent ->
+            void $ appendChild domNode parent
+
+        ReplaceNode targetNode ->
+            -- Now, some nodes don't have parents ... and thus cannot be
+            -- replaced ... but we won't call this for those!  Could
+            -- reconsider the design, I suppose.
+            parentNode targetNode >>=
+                traverse_ (replaceChild domNode targetNode)
+
+
+-- | Render the virtual node as a new DOM node, and attach it as the last child
+-- | of the provided parent node.
+-- |
+-- | The first parameter is a function which will be used to handle messages
+-- | that the node produces. (In an Elm `program`, they simply are fed into
+-- | the program's `update` function).
+-- |
+-- | Note that this is not part of the Elm API. Normally, you won't need to
+-- | call this directly -- it is used internally by `program` to setup your
+-- | program in the Elm architecture.
+-- |
+-- | The `RenderedNode` you get back is a structure you can provide to `update`
+-- | with a new virtual node to update the DOM to match the new virtual node.
+render :: ∀ msg. (msg -> IOSync Unit) -> Node msg -> RenderAt -> IOSync (RenderedNode msg)
+render cb vNode refNode = do
+    eventNode <-
+        liftEff $ newRef $ mkExists $ RootEventNode cb
+
+    renderHelp eventNode vNode refNode
+
+
+renderHelp :: ∀ msg. EventNodeRef msg -> Node msg -> RenderAt -> IOSync (RenderedNode msg)
+renderHelp eventNode vNode refNode =
     case vNode of
-        Thunk l _ ->
-            render doc (force l)
+        Thunk lazyNode thunk -> do
+            rendered <- renderHelp eventNode (force lazyNode) refNode
+            newRenderedNode $
+                RThunk rendered thunk
 
-        Thunk2 l _ ->
-            render doc (force l)
+        Thunk2 lazyNode thunk -> do
+            rendered <- renderHelp eventNode (force lazyNode) refNode
+            newRenderedNode $
+                RThunk2 rendered thunk
 
-        Thunk3 l _ ->
-            render doc (force l)
+        Thunk3 lazyNode thunk -> do
+            rendered <- renderHelp eventNode (force lazyNode) refNode
+            newRenderedNode $
+                RThunk3 rendered thunk
 
-        Text string ->
-            createTextNode string doc
-            <#> textToNode
-            # liftEff
+        Text string -> do
+            doc <- renderInDocument refNode
+            domNode <- liftEff $ textToNode <$> createTextNode string doc
+            renderAt refNode domNode
+            newRenderedNode $
+                RText string domNode eventNode
 
         PlainNode rec children -> do
-            domNode <-
-                case rec.namespace of
-                    Just ns ->
-                        liftEff $ createElementNS rec.namespace rec.tag doc
+            element <-
+                renderInDocument refNode >>=
+                    case rec.namespace of
+                        Just ns ->
+                            liftEff <<< createElementNS rec.namespace rec.tag
 
-                    Nothing ->
-                        liftEff $ createElement rec.tag doc
+                        Nothing ->
+                            liftEff <<< createElement rec.tag
 
-            applyFacts (initialFactChanges rec.facts) domNode
+            let domNode = elementToNode element
 
-            for_ children \child -> do
-                renderedChild <- render doc child
-                liftEff $ appendChild renderedChild (elementToNode domNode)
+            renderedRec <-
+                renderFacts eventNode rec.facts element
 
-            pure (elementToNode domNode)
+            renderedChildren <-
+                for children \child ->
+                    renderHelp eventNode child (appendChildTo domNode)
+
+            renderAt refNode domNode
+
+            newRenderedNode $
+                RPlainNode rec renderedRec renderedChildren
 
         KeyedNode rec children -> do
-            domNode <-
-                case rec.namespace of
-                    Just ns ->
-                        liftEff $ createElementNS rec.namespace rec.tag doc
+            element <-
+                renderInDocument refNode >>=
+                    case rec.namespace of
+                        Just ns ->
+                            liftEff <<< createElementNS rec.namespace rec.tag
 
-                    Nothing ->
-                        liftEff $ createElement rec.tag doc
+                        Nothing ->
+                            liftEff <<< createElement rec.tag
 
-            applyFacts (initialFactChanges rec.facts) domNode
+            let domNode = elementToNode element
 
-            for_ children \(Tuple key child) -> do
-                renderedChild <- render doc child
-                liftEff $ appendChild renderedChild (elementToNode domNode)
+            renderedRec <-
+                renderFacts eventNode rec.facts element
 
-            pure (elementToNode domNode)
+            renderedChildren <-
+                for children \(key /\ child) ->
+                    renderHelp eventNode child (appendChildTo domNode)
+                        <#> \rendered -> (key /\ rendered)
+
+            renderAt refNode domNode
+
+            newRenderedNode $
+                RKeyedNode rec renderedRec renderedChildren
 
         Tagger coyo ->
-            -- We compose consecutive taggers now, rather than up-front,
-            -- because we want to compare the funcs for reference equality
-            -- when diffing. But it's better to compose here, because we're
-            -- only writing out one DOM node. Remember to check how this
-            -- affects traversals and indexes!
-            composeTaggers coyo # unCoyoneda \func subNode -> do
-                domNode <-
-                    render doc subNode
+            coyo # unCoyoneda \func subNode -> do
+                subEventNode <-
+                    liftEff $ newRef $ mkExists $
+                        SubEventNode func eventNode
 
-                -- Now, this may be a flaw in my scheme. I can't add a listener
-                -- to something unless it's an Element, not a Node. Now, in
-                -- theory you can add a tagger in Elm to a Node that isn't an
-                -- Element ...  e.g. a text node. However, I'm pretty sure that
-                -- it doesn't matter, because you can't attach Elm listeners to
-                -- plain text ...  you'd need to put it in a `span` or
-                -- something. (Since plain text has no Elm attributes). So, I
-                -- think this will work out OK, but we'll need to see.
-                for_ (nodeToElement domNode) \element -> do
-                    tagger <-
-                        makeTagger func
+                rendered <-
+                    renderHelp subEventNode subNode refNode
 
-                    addEventHandler elmMsgEvent tagger false (elementToEventTarget element)
-
-                    -- We also store it as a property on the node, so that we can
-                    -- mutate the handler in future instead of removing it and
-                    -- re-adding it.
-                    --
-                    -- I suppose at some point I should reconsider this strategy of
-                    -- leaving things in the DOM ... it's a handy way to keep state
-                    -- around, I suppose, but we could probably do better if we
-                    -- tried.
-                    setTagger tagger element
-
-                pure domNode
+                -- TODO: Review the unsafeCoerce ... could it be avoided?
+                newRenderedNode $
+                    RTagger (coyoneda func rendered) (unsafeCoerce subEventNode)
 
 
--- APPLY FACTS
-
-applyFacts :: ∀ f msg. (Foldable f) => f (FactChange msg) -> Element -> IOSync Unit
-applyFacts operations elem = do
-    for_ operations \operation ->
-        case operation of
-            AddAttribute key value ->
-                liftEff $ setAttribute key value elem
-
-            RemoveAttribute key ->
-                liftEff $ removeAttribute key elem
-
-            AddAttributeNS ns key value ->
-                setAttributeNS ns key value elem
-
-            RemoveAttributeNS ns key ->
-                removeAttributeNS ns key elem
-
-            AddEvent key options decoder -> do
-                handlers  <-
-                    (fromMaybe StrMap.empty <<< toMaybe) <$>
-                        getHandlers elem
-
-                handler <-
-                    makeEventHandler {options, decoder}
-
-                let newHandlers = StrMap.insert (unwrap key) handler handlers
-
-                addEventHandler key handler false (elementToEventTarget elem)
-                setHandlers newHandlers elem
-
-            MutateEvent key options decoder -> do
-                handlers <-
-                    (fromMaybe StrMap.empty <<< toMaybe) <$>
-                        getHandlers elem
-
-                let handler =
-                        case StrMap.lookup (unwrap key) handlers of
-                            Just h ->
-                                h
-
-                            Nothing ->
-                                unsafeCrashWith "Could not find expected handler in DOM"
-
-                setHandlerInfo {options, decoder} handler
-
-            RemoveEvent key options -> do
-                handlers <-
-                    (fromMaybe StrMap.empty <<< toMaybe) <$>
-                        getHandlers elem
-
-                let handler =
-                        case StrMap.lookup (unwrap key) handlers of
-                            Just h ->
-                                h
-
-                            Nothing ->
-                                unsafeCrashWith "Could not find expected handler in DOM"
-
-                removeEventHandler key handler false (elementToEventTarget elem)
-
-                let newHandlers = StrMap.delete (unwrap key) handlers
-                setHandlers newHandlers elem
-
-            AddStyle key value ->
-                setStyle key value elem
-
-            RemoveStyle key ->
-                removeStyle key elem
-
-            RemoveAllStyles ->
-                liftEff $ removeAttribute "style" elem
-
-            AddProperty key value ->
-                if key == "value"
-                    -- Changes to value are deferred to the real DOM, instead of the virtual
-                    -- DOM, since the browser will change "value" behind our backs.
-                    -- Note that we should probably treat "checked" like this as well:
-                    -- https://github.com/elm-lang/virtual-dom/issues/117
-                    then setPropertyIfDifferent key value elem
-                    else setProperty key value elem
-
-            RemoveProperty key ->
-                removeProperty key elem
+newRenderedNode :: ∀ msg. RenderedNodeF msg -> IOSync (RenderedNode msg)
+newRenderedNode nodeF =
+    liftEff $ RenderedNode <$> newRef nodeF
 
 
--- These store & retrieve some data as properties in the DOM ... should
--- re-assess that strategy at some point!
-foreign import getHandlers :: ∀ msg. Element -> IOSync (Nullable (StrMap (MsgHandler msg)))
-foreign import setHandlers :: ∀ msg. StrMap (MsgHandler msg) -> Element -> IOSync Unit
-foreign import removeHandlers :: Element -> IOSync Unit
+renderFacts :: ∀ msg. EventNodeRef msg -> OrganizedFacts msg -> Element -> IOSync (RenderedNodeRecord msg)
+renderFacts eventNode facts element = do
+    forWithIndex_ facts.attributes \key value ->
+        liftEff $ setAttribute key value element
 
-foreign import getTagger :: ∀ a b. Element -> IOSync (Nullable (TaggerHandler a b))
-foreign import setTagger :: ∀ a b. TaggerHandler a b -> Element -> IOSync Unit
-foreign import removeTagger :: Element -> IOSync Unit
+    forWithIndex_ facts.attributesNS \ns ->
+        traverseWithIndex_ \key value ->
+            setAttributeNS ns key value element
 
+    forWithIndex_ facts.styles \key value ->
+        setStyle key value element
 
--- When Elm knows that there previously was a listener for an event, it does a
--- kind of "mutate listener" instead of removing the listener and adding a new
--- one. This might happen frequently, because testing the equality of decoders
--- is not fully decidable. So, you may end up with a lot of spurious listener
--- mutations. Removing and adding listeners is probably a little expensive, and
--- could even affect behaviour in some cases. So, instead, Elm mutates the
--- listener, by having the listener refer to some data "deposited" as a
--- property on the DOM node. Thus, we can mutate the listener by changing that
--- data.
+    forWithIndex_ facts.properties \key value ->
+        setProperty key value element
 
+    handlers <-
+        forWithIndex facts.events \key (options /\ decoder) -> liftEff do
+            handlerInfoRef <- newRef { options, decoder }
+            let listener = eventListener $ runIOSync' <<< handleEvent handlerInfoRef eventNode
+            addEventListener (EventType key) listener false (elementToEventTarget element)
+            pure (Tuple listener handlerInfoRef)
 
--- | The information that a handler needs (in addition to the event!)
-type HandlerInfo msg =
-    { decoder :: Decoder msg
-    , options :: Options
-    }
+    pure
+        { element
+        , eventNode
+        , handlers
+        }
 
-
-type MsgHandler msg =
-    EventHandler (HandlerInfo msg)
-
-
--- | The name for the custom event we use to dispatch Elm messages up the tree.
-elmMsgEvent :: EventType
-elmMsgEvent = wrap "elm_msg_event"
-
-
--- | Attaches the initial info to a newly produced handler. The info is
--- | mutable, so this is an `Eff`
-makeEventHandler :: ∀ msg. HandlerInfo msg -> IOSync (MsgHandler msg)
-makeEventHandler = eventHandler handleEvent
+-- | Use a new virtual Node to update a previously rendered node. This is an
+-- | effectful function in two senses: the DOM which the `RenderedNode` had
+-- | previously produced will be updated, and the `RenderedNode` itself will
+-- | be updated to reflect the new virtual node.
+update :: ∀ msg. Node msg -> RenderedNode msg -> IOSync Unit
+update vNode rNode =
+    updateHelp (Just id) vNode rNode
 
 
--- | The generic handler for any Elm event. We're doing something different
--- | here than Elm does. Instead of interally tracking "event nodes" and
--- | passing things up that chain, we apply our decoder and then re-dispatch a
--- | custom event with the results. So, whatever is above us in the DOM can do
--- | what it likes with that -- less book-keeping is needed.
-handleEvent :: ∀ msg. HandlerInfo msg -> Event -> IOSync Unit
-handleEvent info event =
-    case decodeValue info.decoder (toForeign event) of
-        Err _ ->
-            -- Should we dispatch a distinct message that someone could listen
-            -- to in order to catch the error? Might not be a bad idea.
-            -- However, failing the decoder at this stage is a genuine strategy
-            -- ... that way, you don't have to go through an `update` round.
-            -- So, it's not as though this *necessarily* represents a bug.
-            pure unit
+-- We don't necessarily know that the `msg` type for the virtual node is the
+-- saame as the `msg` type for the rendered node, so we model that with a
+-- `Maybe Leibniz` type.
+--
+-- Note that this modifies the `RenderedNode` in-place (it is actually a
+-- `Ref`).  This is basically to conform with what it's doing to the DOM that
+-- the RenderedNode holds references to ... since modifies the one in place, it
+-- logically needs to modify the other in-place, and be effectful in relation
+-- to both.
+updateHelp :: ∀ vMsg rMsg. Maybe (vMsg ~ rMsg) -> Node vMsg -> RenderedNode rMsg -> IOSync Unit
+updateHelp proof vNode wrapped@(RenderedNode rNode) = do
+    renderedNode <- liftEff $ readRef rNode
 
-        Ok msg -> do
-            -- Perhaps curiously, the Elm code doesn't stopPropagation or
-            -- preventDefault unless the decoder succeeds ... so, we'll do that
-            -- as well.
-            when info.options.preventDefault $
-                liftEff $ preventDefault event
+    case vNode, renderedNode of
+        Text vText, RText rText domNode eventNode ->
+            -- In this case, we might not even really need to keep the original
+            -- text, sincw we could just ask the DOM for it. Presumably that
+            -- would be slower, though?
+            unless (vText == rText) $ liftEff do
+                setTextContent vText domNode
+                writeRef rNode $ RText vText domNode eventNode
 
-            when info.options.stopPropagation $
-                liftEff $ stopPropagation event
+        Thunk vLazy vThunk, RThunk subNode rThunk ->
+            -- For thunks, there is nothing to do if we can conclude that the
+            -- two thunks are equal. Otherwise, we force the lazy virtual node
+            -- and continue updating.
+            --
+            -- TODO: Review the type implications of this, and the unsafeCoerce
+            -- ... I'm not sure I have this right.
+            unless (equalThunks vThunk rThunk) do
+                updateHelp proof (force vLazy) subNode
+                liftEff $ writeRef rNode $
+                    RThunk subNode (unsafeCoerce vThunk)
 
-            -- We re-dispatch the transformed message from the point in the
-            -- DOM where the listener was attached, not necessarily where the
-            -- event originated, since that will match the taggers up.
-            msgEvent <-
-                makeCustomEvent elmMsgEvent (toForeign msg)
+        Thunk2 vLazy vThunk, RThunk2 subNode rThunk ->
+            unless (equalThunks2 vThunk rThunk) do
+                updateHelp proof (force vLazy) subNode
+                liftEff $ writeRef rNode $
+                    RThunk2 subNode (unsafeCoerce vThunk)
 
-            void $ liftEff $
-                dispatchEvent (customEventToEvent msgEvent) (currentEventTarget event)
+        Thunk3 vLazy vThunk, RThunk3 subNode rThunk ->
+            unless (equalThunks3 vThunk rThunk) do
+                updateHelp proof (force vLazy) subNode
+                liftEff $ writeRef rNode $
+                    RThunk3 subNode (unsafeCoerce vThunk)
+
+        -- Elm will diff the children whether or not the taggers are equal, so
+        -- long as there are the same number of nested taggers.  So, it diffs
+        -- children even we can't know that they use the same `msg` type. The
+        -- reason, essentially, is that we can't always know that two taggers
+        -- are equal, even if they really are, so we want to minimize the cost
+        -- of those false negatives.  It wouldn't be great to always have to
+        -- redraw them, for instance.
+        Tagger vCoyo, RTagger rCoyo eventNodeRef ->
+            vCoyo # unCoyoneda \vFunc vSubnode ->
+            rCoyo # unCoyoneda \rFunc rSubnode ->
+                if reallyUnsafeRefEq vFunc rFunc then
+                    -- They are the same function, so we don't need to adjust
+                    -- the eventNode. We can just continue diffing. We also use
+                    -- the equality of the functions as warrant for believing
+                    -- that `vMsg ~ rMsg` for the subnodes ... I should
+                    -- probably think that through more carefully at some
+                    -- point.
+                    updateHelp (Just $ Leibniz unsafeCoerce) vSubnode rSubnode
+                else do
+                    -- In this case, we can't be sure that the functions were
+                    -- the same, but there is lots of scope for false
+                    -- negatives, so we want to minimize the cost of that. So,
+                    -- we update the eventNode in place, and proceed to update
+                    -- the children.  We can't manufacture proof that `vMsg ~
+                    -- rMsg` for the children, since the functions may be
+                    -- coming from different types, for all we know.
+                    unsafeUpdateEventNodeRef vFunc eventNodeRef
+                    updateHelp Nothing vSubnode rSubnode
+
+        KeyedNode vNodeRecord vChildren, RKeyedNode rNodeRecord rendered rChildren ->
+            unsafeCrashWith "TODO"
+
+        PlainNode vNodeRecord vChildren, RPlainNode rNodeRecord rendered rChildren ->
+            unsafeCrashWith "TODO"
+
+        _, _ -> do
+            -- Where the constructors don't match, we just redraw.
+            ( redraw /\ eventNode ) <-
+                lmap replaceNode <$>
+                    redrawAt wrapped
+
+            (RenderedNode newlyRendered) <-
+                renderHelp (unsafeCoerce eventNode) vNode redraw
+
+            -- Now, we need to mutate our old rendered node with the new one.
+            liftEff $ readRef (unsafeCoerce newlyRendered) >>= writeRef rNode
 
 
--- | Oddly, currentTarget returns a `Node` rather than an `EventTarget`, so
--- | we'll coerce. (Presumably the result of `currentTarget` must be an
--- | `EventTarget` seeing as, by definition, it has a listener attached).
-currentEventTarget :: Event -> EventTarget
-currentEventTarget = unsafeCoerce currentTarget
+-- This is unsafe because we're updating the function even though we don't
+-- actually have evidence about the types. The entire scheme is designed to
+-- make the types work out in the end, but it would be difficult to convince
+-- the compiler of that. So, this is something that could be reviewed at some
+-- point to see whether a better design is possible (given the Elm API, and the
+-- efficiencies we're trying to obtain in cases where we get false negatives
+-- when comparing taggers for equality).
+unsafeUpdateEventNodeRef :: ∀ msg a b. (a -> b) -> EventNodeRef msg -> IOSync Unit
+unsafeUpdateEventNodeRef func eventNodeRef =
+    liftEff $ modifyRef eventNodeRef $
+        runExists \eventNode ->
+            case eventNode of
+                RootEventNode _ ->
+                    -- This shouldn't actually happen ... at some stage, I should
+                    -- review the design to see whether I can avoid this case.
+                    mkExists eventNode
 
-
-type TaggerHandler a b =
-    EventHandler (a -> b)
-
-
-makeTagger :: ∀ a b. (a -> b) -> IOSync (TaggerHandler a b)
-makeTagger = eventHandler handleTagger
-
-
-handleTagger :: ∀ a b. (a -> b) -> Event -> IOSync Unit
-handleTagger tagger event =
-    for_ (eventToCustomEvent event >>= detail) \msg -> do
-        -- So, we're not giving ourselves very much type-safety here ... we're
-        -- relying on the DOM to have been setup correctly so that our input is
-        -- an `a` and we should be relaying a `b` upwards. There may be ways to
-        -- improve on this.
-        taggedMsg <-
-            makeCustomEvent elmMsgEvent $ toForeign $ tagger $ unsafeCoerce msg
-
-        maybeNext <-
-            nextEventTarget $ currentTarget event
-
-        for_ maybeNext \next -> liftEff do
-            stopPropagation event
-            dispatchEvent (customEventToEvent taggedMsg) next
+                SubEventNode _ parent ->
+                    -- So, we're just substituting the func while keeping the same
+                    -- parent ... this is the part we don't really have warrant for
+                    -- in the types, except that we're going to proceed to update
+                    -- the children so that the types will work out.
+                    mkExists $ SubEventNode (unsafeCoerce func) parent
 
 
 --  DIFF
 
-data PatchOp msg
-    = PRedraw (Node msg)
-    | PFacts (Array (FactChange msg))
-    | PText String
-    | PTagger (Exists (TaggerFunc msg))
-    | PRemoveLast Int
-    | PAppend (List (Node msg))
-
-
-newtype TaggerFunc msg a
-    = TaggerFunc (a -> msg)
-
-
--- The index is a list of offsets to a root Node.
---
--- * If the patch relates to the root node itself, the list is empty.
---
--- * If the patch relates to a child of the root node, then the list
---   has one member, with the index into the children.
---
--- * And so on.
---
--- The idea is to make it easy to navigate the real DOM, once we get there, while
--- minimizing the iteration through the real DOM (which is postulated to be
--- expensive).
---
--- The original Elm code does this in a different way. There, the index is a
--- single `Int`, representing an offset into the nodes and children in order of
--- traversal. However, the code for actually applying this in `addDomNodes` ...
--- that is, for actually doing the traversal ...  is complex, difficult to
--- understand, and (for that reason) possibly fragile.
---
--- Now, always traversing from a root node using the list would, presumably, be
--- inefficient (or, at least, unoptimized). So, the strategy is to construct our
--- `List (Patch msg)` in such a way that traversing from one to the next ought to
--- be efficient. Then, we just need a function which, given two `List int`,
--- determines how to traverse the DOM efficiently from the first to the second.
--- So, in one case, it might be `nextSibling`, whereas in another case it might be
--- `parent` and then something else etc. In fact, I suppose this function ought to
--- get the root node as another parameter, since if you're sufficiently deep and
--- your next stop is sufficiently shallow, then it might make sense to start over
--- from the root.
---
--- In any event, the idea is that this will be more conceptually clear than the
--- Elm implementation, while hopefully preserving some of the efficiency of the
--- Elm implementation.
-data Patch msg
-    = Patch (List Int) (PatchOp msg)
-
-
--- The Elm version also includes a domNode and eventNode ... we add the domNode
--- later, and we've changed the implementation so that we don't use an eventNode
-makePatch :: ∀ msg. PatchOp msg -> List Int -> Exists Patch
-makePatch type_ index =
-    mkExists $ Patch index type_
-
-
-data Traversal
-    = TRoot                 -- We're already there
-    | TParent Int           -- go to the nth ancestor
-    | TChild (List Int)     -- go to the child with the specified index, and repeat
-    | TSibling SiblingRec
-
-
-type SiblingRec =
-    { up :: Int
-    , from :: Int
-    , to :: Int
-    , down :: List Int
-    }
-
-
-instance showTraversal :: Show Traversal where
-    show TRoot = "TRoot"
-    show (TParent x) = "(TParent " <> show x <> ")"
-    show (TChild x) = "(TChild " <> show x <> ")"
-    show (TSibling s) = "(TSibling {up: " <> show s.up <> ", from: " <> show s.from <> ", to: " <> show s.to <> ", down: " <> show s.down <> "})"
-
-
--- We use this to calculate the most efficient traversal method ... that is, the one which
--- requires the fewest function calls.
---
--- My theory is that a child traversal costs 2, since you'll need to get the list of child nodes
--- and then index into them. But, I haven't really tested ... in theory, one could get actual
--- data for this.
-costOfTraversal :: Traversal -> Int
-costOfTraversal =
-    case _ of
-        TRoot ->
-            0
-
-        TParent x ->
-            x
-
-        TChild x ->
-            length x * 2
-
-        TSibling s ->
-            s.up +
-            (max 3 (abs (s.from - s.to))) +
-            ((length s.down) * 2)
-
-
--- The first param is a sibling offset ... i.e. +1 for next sibling, -1 for
--- previous sibling, +2 for two siblings ahead, etc.
-goSibling :: Int -> DOM.Node -> MaybeT IOSync DOM.Node
-goSibling =
-    tailRecM2 \which domNode ->
-        if which == 0 then
-            pure $ Done domNode
-        else if which > 0 then
-            nextSibling domNode
-            # liftEff
-            # MaybeT
-            <#> {a: which - 1, b: _}
-            <#> Loop
-        else
-            previousSibling domNode
-            # liftEff
-            # MaybeT
-            <#> {a: which + 1, b: _}
-            <#> Loop
-
-
--- Actually do the traversal ..
-performTraversal :: Traversal -> DOM.Node -> MaybeT IOSync DOM.Node
-performTraversal =
-    tailRecM2 \t domNode ->
-        case t of
-            TRoot ->
-                pure $ Done domNode
-
-            TParent x ->
-                if x > 0
-                    then
-                        parentNode domNode
-                        # liftEff
-                        # MaybeT
-                        <#> {a: TParent (x - 1), b: _}
-                        <#> Loop
-
-                    else
-                        pure $ Done domNode
-
-            TChild (Cons c cs) ->
-                childNodes domNode
-                >>= item c
-                # liftEff
-                # MaybeT
-                <#> {a: TChild cs, b: _}
-                <#> Loop
-
-            TChild Nil ->
-                pure $ Done domNode
-
-            TSibling s ->
-                let
-                    distance =
-                        s.to - s.from
-
-                    sideways =
-                        if abs distance > 3
-                            then
-                                performTraversal (TParent 1) >=>
-                                performTraversal (TChild (singleton s.to))
-
-                            else
-                                goSibling distance
-
-                in
-                    performTraversal (TParent s.up) domNode
-                    >>= sideways
-                    <#> {a: TChild s.down, b: _}
-                    <#> Loop
-
-
--- So, figure out how to move from current to destination.
-traversal :: List Int -> List Int -> Traversal
-traversal Nil Nil = TRoot                   -- it's all been equal, and nothing's left, so we're there
-traversal Nil rest = TChild rest            -- Equal until something left on dest, so move to children
-traversal rest Nil = TParent (length rest)  -- Equal until something left on source, so move to parents
-traversal (Cons c cs) (Cons d ds) =         -- Something left on both sides, so take a look ...
-    if c == d
-        then
-            -- If we're still equal, then just keep going
-            traversal cs ds
-
-        else
-            -- Otherwise, we'll go up what's left on the source,
-            -- from one sibling to the next, and then down what's
-            -- left on the dest.
-            TSibling
-                { up: length cs
-                , from: c
-                , to: d
-                , down: ds
-                }
-
-
--- This represents a patch with a domNode filled in ... that is,
--- a patch where we've now determined exactly what it is going to patch.
-data PatchWithNodes msg
-    = PatchWithNodes (Patch msg) DOM.Node
-
-
-diff :: ∀ msg. Node msg -> Node msg -> List (Exists Patch)
-diff a b = diffHelp (Just id) a b Nil Nil
-
-
--- We accumulate the needed patches, by calling ourself recursively.  The `List
--- Int` tracks where we are relative to the root node.  An empty list meeans
--- we're at the root node, and then each list item represent an offset into
--- descendants.
 --
 -- Elm's Virtual DOM continues to diff children past taggers which are not
 -- necessarily equal. Thus, we can't insist that the old node and the new node
@@ -1237,224 +1109,33 @@ diff a b = diffHelp (Just id) a b Nil Nil
 -- they do not. However, we use Leibniz equality to track whether we have
 -- evidence that they are the same, so our behaviour can be a bit different in
 -- one case vs. the other.
---
--- We use an existential type for accumulating patches in a single list.
---
--- TODO: Should probably not use a `List` for the offsets or the patches, since
--- we're appending.  Or, I should prepend and then document that you should
--- reverse once at the end.
+
+{-
 diffHelp :: ∀ msg1 msg2. Maybe (msg1 ~ msg2) -> Node msg1 -> Node msg2 -> List Int -> List (Exists Patch) -> List (Exists Patch)
 diffHelp proof a b index accum =
-    -- We could have a distinct `equalNodes` function but it doesn't seem
-    -- necessary ... we just return the patches unchanged if we're equal.
-    if reallyUnsafeRefEq a b
-        then accum
-        else
-            case a, b of
-                Thunk aLazy aThunk, Thunk bLazy bThunk ->
-                    if equalThunks aThunk bThunk then
-                        -- The Elm code has an extra optimization here ... it
-                        -- mutates the bLazy in-place so that it has the same
-                        -- answer as the aLazy. That way, when we get it next
-                        -- time, and might need to force it to do a diff, we
-                        -- already have the answer. It's a sensible
-                        -- optimization, but a little difficult to do safely in
-                        -- Purescript. It can probably be done unsafely,
-                        -- though, so it would be a nice TODO. It would
-                        -- probably have to depend a little unsafely on the
-                        -- internals of the `Lazy` type, or I suppose we could
-                        -- build our own variant. It would be a kind of
-                        -- `forceWith` where you supply the value that will be
-                        -- forced, rather than running the calculation.
-                        accum
-                    else
-                        -- The Elm code kind of restarts the diffing process
-                        -- with the thunked node as the root, and then groups
-                        -- the resulting patches together in a `PThunk` case.
-                        -- I'm not sure whether that has a point ... it doesn't
-                        -- seem to ... so I'll just calculate the actual nodes
-                        -- and continue diffing in the usual manner ... it feels
-                        -- as though that ought to just work. I guess we'll see!
-                        --
-                        -- The Elm code has pre-forced the `aLazy` side with the
-                        -- optimization mentioned above ... would be nice to do
-                        -- that here as well, but we'll start this way ... we'll
-                        -- only pay when the thunks aren't equal.
-                        diffHelp proof (force aLazy) (force bLazy) index accum
+    PlainNode aNode aChildren, PlainNode bNode bChildren ->
+        if aNode.tag /= bNode.tag || aNode.namespace /= bNode.namespace
+            then snoc accum (makePatch (PRedraw b) index)
+            else
+                let
+                    factsDiff =
+                        diffFacts proof aNode.facts bNode.facts
 
-                Thunk2 aLazy aThunk, Thunk2 bLazy bThunk ->
-                    -- See comments on the `Thunk` case
-                    if equalThunks2 aThunk bThunk then
-                        accum
-                    else
-                        diffHelp proof (force aLazy) (force bLazy) index accum
+                    patchesWithFacts =
+                        if Array.null factsDiff
+                            then accum
+                            else snoc accum (makePatch (PFacts factsDiff) index)
 
-                Thunk3 aLazy aThunk, Thunk3 bLazy bThunk ->
-                    -- See comments on the `Thunk` case
-                    if equalThunks3 aThunk bThunk then
-                        accum
-                    else
-                        diffHelp proof (force aLazy) (force bLazy) index accum
+                in
+                    -- diffChildren calls diffHelp, and I'm guessing that it
+                    -- possibly won't be tail-recursive, because it's not calling
+                    -- itself? So, may need to do something about that? Or
+                    -- possibly it's not a problem.
+                    diffChildren proof aChildren bChildren patchesWithFacts index
 
-                Tagger aTagger, Tagger bTagger ->
-                    -- Elm will diff the children whether or not the taggers
-                    -- are equal, so long as there are the same number of
-                    -- nested taggers.  So, it diffs children even we can't
-                    -- know that they use the same `msg` type. The reason,
-                    -- essentially, is that we can't always know that two
-                    -- taggers are equal, even if they really are, so we want
-                    -- to minimize the cost of those false negatives.  It
-                    -- wouldn't be great to always have to redraw them, for
-                    -- instance.
-                    --
-                    -- We check equality on the non-composed version, since
-                    -- composition destroys the reference equality.
-                    -- (equalTaggers will follow nested taggers).
-                    case equalTaggers aTagger bTagger of
-                        Just true ->
-                            -- If the taggers were equal, then we don't need a
-                            -- patch for the taggers, and we have warrant to
-                            -- believe that the subnodes are of the same type.
-                            --
-                            -- We continue diffing at the same index, since the
-                            -- tagger doesn't get a separate DOM node.
-                            composeTaggers aTagger # unCoyoneda \_ node1 ->
-                            composeTaggers bTagger # unCoyoneda \_ node2 ->
-                                diffHelp (Just $ Leibniz unsafeCoerce) node1 node2 index accum
-
-                        Just false ->
-                            -- If the taggers are definitely unequal, then
-                            -- we just redraw.
-                            snoc accum (makePatch (PRedraw b) index)
-
-                        Nothing ->
-                            -- If we're not sure, then we need a patch for
-                            -- the tagger itself, and also continue on.
-                            -- But, without proof that the subnodes are the
-                            -- same type.
-                            composeTaggers aTagger # unCoyoneda \_ node1 ->
-                            composeTaggers bTagger # unCoyoneda \func node2 ->
-                                diffHelp Nothing node1 node2 index $
-                                    snoc accum (makePatch (PTagger $ mkExists $ TaggerFunc func) index)
-
-                Text aText, Text bText ->
-                    if aText == bText
-                        then accum
-                        else snoc accum (makePatch (PText bText) index)
-
-                PlainNode aNode aChildren, PlainNode bNode bChildren ->
-                    if aNode.tag /= bNode.tag || aNode.namespace /= bNode.namespace
-                        then snoc accum (makePatch (PRedraw b) index)
-                        else
-                            let
-                                factsDiff =
-                                    diffFacts proof aNode.facts bNode.facts
-
-                                patchesWithFacts =
-                                    if Array.null factsDiff
-                                        then accum
-                                        else snoc accum (makePatch (PFacts factsDiff) index)
-
-                            in
-                                -- diffChildren calls diffHelp, and I'm guessing that it
-                                -- possibly won't be tail-recursive, because it's not calling
-                                -- itself? So, may need to do something about that? Or
-                                -- possibly it's not a problem.
-                                diffChildren proof aChildren bChildren patchesWithFacts index
-
-                KeyedNode aNode aChildren, KeyedNode bNode bChildren ->
-                    unsafeCrashWith "TODO"
-
-{-
-		case 'keyed-node':
-			// Bail if obvious indicators have changed. Implies more serious
-			// structural changes such that it's not worth it to diff.
-			if (a.tag !== b.tag || a.namespace !== b.namespace)
-			{
-				patches.push(makePatch('p-redraw', index, b));
-				return;
-			}
-
-			var factsDiff = diffFacts(a.facts, b.facts);
-
-			if (typeof factsDiff !== 'undefined')
-			{
-				patches.push(makePatch('p-facts', index, factsDiff));
-			}
-
-			diffKeyedChildren(a, b, patches, index);
-			return;
 -}
 
 {-
-		case 'custom':
-			if (a.impl !== b.impl)
-			{
-				patches.push(makePatch('p-redraw', index, b));
-				return;
-			}
-
-			var factsDiff = diffFacts(a.facts, b.facts);
-			if (typeof factsDiff !== 'undefined')
-			{
-				patches.push(makePatch('p-facts', index, factsDiff));
-			}
-
-			var patch = b.impl.diff(a,b);
-			if (patch)
-			{
-				patches.push(makePatch('p-custom', index, patch));
-				return;
-			}
-
-			return;
--}
-
-                _, _ ->
-                    -- This covers the case where they are different types
-                    snoc accum (makePatch (PRedraw b) index)
-
-
--- Could optimize this stage out by writing a function that went straight
--- from OrganizedFacts to effects ... should try profiling at some point.
--- Also, there is probably a more efficient way to do this without all
--- the singleton list creation.
-initialFactChanges :: ∀ msg. OrganizedFacts msg -> List (FactChange msg)
-initialFactChanges facts =
-    attributeChanges <>
-    attributeNsChanges <>
-    eventChanges <>
-    styleChanges <>
-    propertyChanges
-
-    where
-        attributeChanges =
-            facts.attributes #
-                foldMap \k v ->
-                    singleton (AddAttribute k v)
-
-        attributeNsChanges =
-            facts.attributesNS #
-                foldMap \ns ->
-                    foldMap \k v ->
-                        singleton (AddAttributeNS ns k v)
-
-        eventChanges =
-            facts.events #
-                foldMap \k (Tuple options decoder) ->
-                    singleton (AddEvent (wrap k) options decoder)
-
-        styleChanges =
-            facts.styles #
-                foldMap \k v ->
-                    singleton (AddStyle k v)
-
-        propertyChanges =
-            facts.properties #
-                foldMap \k v ->
-                    singleton (AddProperty k v)
-
-
 diffFacts :: ∀ oldMsg newMsg. Maybe (oldMsg ~ newMsg) -> OrganizedFacts oldMsg -> OrganizedFacts newMsg -> Array (FactChange newMsg)
 diffFacts proof old new =
     runPure do
@@ -1631,8 +1312,9 @@ diffFacts proof old new =
                     foldM newStyle unit new.styles
 
             pure accum
+-}
 
-
+{-
 diffChildren :: ∀ msg1 msg2. Maybe (msg1 ~ msg2) -> List (Node msg1) -> List (Node msg2) -> List (Exists Patch) -> List Int -> List (Exists Patch)
 diffChildren proof aChildren bChildren patches rootIndex =
     let
@@ -1660,334 +1342,96 @@ diffChildren proof aChildren bChildren patches rootIndex =
 
     in
         diffPairs.patches
-
-
-{-
-function diffKeyedChildren(aParent, bParent, patches, rootIndex)
-{
-	var localPatches = [];
-
-	var changes = {}; // Dict String Entry
-	var inserts = []; // Array { index : Int, entry : Entry }
-	// type Entry = { tag : String, vnode : VNode, index : Int, data : _ }
-
-	var aChildren = aParent.children;
-	var bChildren = bParent.children;
-	var aLen = aChildren.length;
-	var bLen = bChildren.length;
-	var aIndex = 0;
-	var bIndex = 0;
-
-	var index = rootIndex;
-
-	while (aIndex < aLen && bIndex < bLen)
-	{
-		var a = aChildren[aIndex];
-		var b = bChildren[bIndex];
-
-		var aKey = a._0;
-		var bKey = b._0;
-		var aNode = a._1;
-		var bNode = b._1;
-
-		// check if keys match
-
-		if (aKey === bKey)
-		{
-			index++;
-			diffHelp(aNode, bNode, localPatches, index);
-			index += aNode.descendantsCount || 0;
-
-			aIndex++;
-			bIndex++;
-			continue;
-		}
-
-		// look ahead 1 to detect insertions and removals.
-
-		var aLookAhead = aIndex + 1 < aLen;
-		var bLookAhead = bIndex + 1 < bLen;
-
-		if (aLookAhead)
-		{
-			var aNext = aChildren[aIndex + 1];
-			var aNextKey = aNext._0;
-			var aNextNode = aNext._1;
-			var oldMatch = bKey === aNextKey;
-		}
-
-		if (bLookAhead)
-		{
-			var bNext = bChildren[bIndex + 1];
-			var bNextKey = bNext._0;
-			var bNextNode = bNext._1;
-			var newMatch = aKey === bNextKey;
-		}
-
-
-		// swap a and b
-		if (aLookAhead && bLookAhead && newMatch && oldMatch)
-		{
-			index++;
-			diffHelp(aNode, bNextNode, localPatches, index);
-			insertNode(changes, localPatches, aKey, bNode, bIndex, inserts);
-			index += aNode.descendantsCount || 0;
-
-			index++;
-			removeNode(changes, localPatches, aKey, aNextNode, index);
-			index += aNextNode.descendantsCount || 0;
-
-			aIndex += 2;
-			bIndex += 2;
-			continue;
-		}
-
-		// insert b
-		if (bLookAhead && newMatch)
-		{
-			index++;
-			insertNode(changes, localPatches, bKey, bNode, bIndex, inserts);
-			diffHelp(aNode, bNextNode, localPatches, index);
-			index += aNode.descendantsCount || 0;
-
-			aIndex += 1;
-			bIndex += 2;
-			continue;
-		}
-
-		// remove a
-		if (aLookAhead && oldMatch)
-		{
-			index++;
-			removeNode(changes, localPatches, aKey, aNode, index);
-			index += aNode.descendantsCount || 0;
-
-			index++;
-			diffHelp(aNextNode, bNode, localPatches, index);
-			index += aNextNode.descendantsCount || 0;
-
-			aIndex += 2;
-			bIndex += 1;
-			continue;
-		}
-
-		// remove a, insert b
-		if (aLookAhead && bLookAhead && aNextKey === bNextKey)
-		{
-			index++;
-			removeNode(changes, localPatches, aKey, aNode, index);
-			insertNode(changes, localPatches, bKey, bNode, bIndex, inserts);
-			index += aNode.descendantsCount || 0;
-
-			index++;
-			diffHelp(aNextNode, bNextNode, localPatches, index);
-			index += aNextNode.descendantsCount || 0;
-
-			aIndex += 2;
-			bIndex += 2;
-			continue;
-		}
-
-		break;
-	}
-
-	// eat up any remaining nodes with removeNode and insertNode
-
-	while (aIndex < aLen)
-	{
-		index++;
-		var a = aChildren[aIndex];
-		var aNode = a._1;
-		removeNode(changes, localPatches, a._0, aNode, index);
-		index += aNode.descendantsCount || 0;
-		aIndex++;
-	}
-
-	var endInserts;
-	while (bIndex < bLen)
-	{
-		endInserts = endInserts || [];
-		var b = bChildren[bIndex];
-		insertNode(changes, localPatches, b._0, b._1, undefined, endInserts);
-		bIndex++;
-	}
-
-	if (localPatches.length > 0 || inserts.length > 0 || typeof endInserts !== 'undefined')
-	{
-		patches.push(makePatch('p-reorder', rootIndex, {
-			patches: localPatches,
-			inserts: inserts,
-			endInserts: endInserts
-		}));
-	}
-}
-
-
-var POSTFIX = '_elmW6BL';
-
-
-function insertNode(changes, localPatches, key, vnode, bIndex, inserts)
-{
-	var entry = changes[key];
-
-	// never seen this key before
-	if (typeof entry === 'undefined')
-	{
-		entry = {
-			tag: 'insert',
-			vnode: vnode,
-			index: bIndex,
-			data: undefined
-		};
-
-		inserts.push({ index: bIndex, entry: entry });
-		changes[key] = entry;
-
-		return;
-	}
-
-	// this key was removed earlier, a match!
-	if (entry.tag === 'remove')
-	{
-		inserts.push({ index: bIndex, entry: entry });
-
-		entry.tag = 'move';
-		var subPatches = [];
-		diffHelp(entry.vnode, vnode, subPatches, entry.index);
-		entry.index = bIndex;
-		entry.data.data = {
-			patches: subPatches,
-			entry: entry
-		};
-
-		return;
-	}
-
-	// this key has already been inserted or moved, a duplicate!
-	insertNode(changes, localPatches, key + POSTFIX, vnode, bIndex, inserts);
-}
-
-
-function removeNode(changes, localPatches, key, vnode, index)
-{
-	var entry = changes[key];
-
-	// never seen this key before
-	if (typeof entry === 'undefined')
-	{
-		var patch = makePatch('p-remove', index, undefined);
-		localPatches.push(patch);
-
-		changes[key] = {
-			tag: 'remove',
-			vnode: vnode,
-			index: index,
-			data: patch
-		};
-
-		return;
-	}
-
-	// this key was inserted earlier, a match!
-	if (entry.tag === 'insert')
-	{
-		entry.tag = 'move';
-		var subPatches = [];
-		diffHelp(vnode, entry.vnode, subPatches, index);
-
-		var patch = makePatch('p-remove', index, {
-			patches: subPatches,
-			entry: entry
-		});
-		localPatches.push(patch);
-
-		return;
-	}
-
-	// this key has already been removed or moved, a duplicate!
-	removeNode(changes, localPatches, key + POSTFIX, vnode, index);
-}
 -}
 
+-- APPLY FACTS
 
-addDomNodes :: DOM.Node -> List (Exists Patch) -> IOSync (List (Exists PatchWithNodes))
-addDomNodes rootNode patches = do
-    patches
-        # List.foldM step
-            { currentNode: rootNode
-            , currentIndex: Nil
-            , accum: Nil
-            }
-        <#> \result ->
-            reverse result.accum
+{-
+applyFacts :: ∀ f msg. (Foldable f) => f (FactChange msg) -> Element -> IOSync Unit
+applyFacts operations elem = do
+    for_ operations \operation ->
+        case operation of
+            AddAttribute key value ->
+                liftEff $ setAttribute key value elem
 
-    where
-        step params = runExists \patch@(Patch index _) -> do
-            let
-                fromRoot =
-                    traversal Nil index
+            RemoveAttribute key ->
+                liftEff $ removeAttribute key elem
 
-                fromCurrent =
-                    traversal params.currentIndex index
+            AddAttributeNS ns key value ->
+                setAttributeNS ns key value elem
 
-                best =
-                    if (costOfTraversal fromRoot) < (costOfTraversal fromCurrent)
-                        then performTraversal fromRoot rootNode
-                        else performTraversal fromCurrent params.currentNode
+            RemoveAttributeNS ns key ->
+                removeAttributeNS ns key elem
 
-            maybeDest <-
-                runMaybeT best
+            AddEvent key options decoder -> do
+                handlers  <-
+                    (fromMaybe StrMap.empty <<< toMaybe) <$>
+                        getHandlers elem
 
-            case maybeDest of
-                Just domNode ->
-                    let
-                        patchWithNodes =
-                            mkExists $ PatchWithNodes patch domNode
-                    in
-                        pure
-                            { currentNode: domNode
-                            , currentIndex: index
-                            , accum: Cons patchWithNodes params.accum
-                            }
+                handler <-
+                    makeEventHandler {options, decoder}
 
-                Nothing ->
-                    -- Now, I think crashing if the DOM has been unexpectedly modified is probably
-                    -- the right thing to do, since all bets are then off. I suppose it's either that,
-                    -- or revert to a complete redraw? In any event, the other question is where to
-                    -- handle this problem ... we could just throw an exception here and let someone
-                    -- else handle it. Also, we should add some more information, to help with debugging.
-                    unsafeCrashWith "Problem traversing DOM -- has it been modified from the outside?"
+                let newHandlers = StrMap.insert (unwrap key) handler handlers
 
+                addEventHandler key handler false (elementToEventTarget elem)
+                setHandlers newHandlers elem
 
--- APPLY PATCHES
+            MutateEvent key options decoder -> do
+                handlers <-
+                    (fromMaybe StrMap.empty <<< toMaybe) <$>
+                        getHandlers elem
 
-applyPatches :: DOM.Node -> List (Exists Patch) -> IOSync DOM.Node
-applyPatches rootDomNode patches =
-    if List.null patches
-        then
-            pure rootDomNode
+                let handler =
+                        case StrMap.lookup (unwrap key) handlers of
+                            Just h ->
+                                h
 
-        else
-            addDomNodes rootDomNode patches
-            >>= applyPatchesHelp rootDomNode
+                            Nothing ->
+                                unsafeCrashWith "Could not find expected handler in DOM"
 
+                setHandlerInfo {options, decoder} handler
 
-applyPatchesHelp :: DOM.Node -> List (Exists PatchWithNodes) -> IOSync DOM.Node
-applyPatchesHelp =
-    List.foldM \rootNode ->
-        runExists \(PatchWithNodes patch@(Patch index _) domNode) -> do
-            newNode <- applyPatch patch domNode
+            RemoveEvent key options -> do
+                handlers <-
+                    (fromMaybe StrMap.empty <<< toMaybe) <$>
+                        getHandlers elem
 
-            -- This is a little hackish ... should think this through better.
-            -- But, basically the idea is that if the patch index was nil,
-            -- we want to go on with the newNode. If not ... that is, if
-            -- we were patching further on ... then we don't want to change
-            -- the rootNode.
-            if index == Nil
-                then pure newNode
-                else pure rootNode
+                let handler =
+                        case StrMap.lookup (unwrap key) handlers of
+                            Just h ->
+                                h
 
+                            Nothing ->
+                                unsafeCrashWith "Could not find expected handler in DOM"
 
+                removeEventHandler key handler false (elementToEventTarget elem)
+
+                let newHandlers = StrMap.delete (unwrap key) handlers
+                setHandlers newHandlers elem
+
+            AddStyle key value ->
+                setStyle key value elem
+
+            RemoveStyle key ->
+                removeStyle key elem
+
+            RemoveAllStyles ->
+                liftEff $ removeAttribute "style" elem
+
+            AddProperty key value ->
+                if key == "value"
+                    -- Changes to value are deferred to the real DOM, instead of the virtual
+                    -- DOM, since the browser will change "value" behind our backs.
+                    -- Note that we should probably treat "checked" like this as well:
+                    -- https://github.com/elm-lang/virtual-dom/issues/117
+                    then setPropertyIfDifferent key value elem
+                    else setProperty key value elem
+
+            RemoveProperty key ->
+                removeProperty key elem
+-}
+
+{-
 applyPatch :: ∀ msg. Patch msg -> DOM.Node -> IOSync DOM.Node
 applyPatch (Patch index patchOp) domNode = do
     document <-
@@ -2043,102 +1487,69 @@ applyPatch (Patch index patchOp) domNode = do
                 render document >=> ((flip appendChild) domNode >>> liftEff)
 
             pure domNode
-
-{-
-		case 'p-remove':
-			var data = patch.data;
-			if (typeof data === 'undefined')
-			{
-				domNode.parentNode.removeChild(domNode);
-				return domNode;
-			}
-			var entry = data.entry;
-			if (typeof entry.index !== 'undefined')
-			{
-				domNode.parentNode.removeChild(domNode);
-			}
-			entry.data = applyPatchesHelp(domNode, data.patches);
-			return domNode;
-
-		case 'p-reorder':
-			var data = patch.data;
-
-            // remove end inserts
-            var frag = applyPatchReorderEndInsertsHelp(data.endInserts, patch);
-
-            // removals
-            domNode = applyPatchesHelp(domNode, data.patches);
-
-            // inserts
-            var inserts = data.inserts;
-            for (var i = 0; i < inserts.length; i++)
-            {
-                var insert = inserts[i];
-                var entry = insert.entry;
-                var node = entry.tag === 'move'
-                    ? entry.data
-                    : render(entry.vnode, patch.eventNode);
-                domNode.insertBefore(node, domNode.childNodes[insert.index]);
-            }
-
-            // add end inserts
-            if (typeof frag !== 'undefined')
-            {
-                domNode.appendChild(frag);
-            }
-
-            return domNode;
-
-function applyPatchReorderEndInsertsHelp(endInserts, patch)
-{
-	if (typeof endInserts === 'undefined')
-	{
-		return;
-	}
-
-	var frag = localDoc.createDocumentFragment();
-	for (var i = 0; i < endInserts.length; i++)
-	{
-		var insert = endInserts[i];
-		var entry = insert.entry;
-		frag.appendChild(entry.tag === 'move'
-			? entry.data
-			: render(entry.vnode, patch.eventNode)
-		);
-	}
-	return frag;
-}
 -}
 
-            {-
-            var impl = patch.data;
-			return impl.applyPatch(domNode, impl.data);
-            -}
 
 
-redraw :: ∀ msg. DOM.Node -> Node msg -> IOSync DOM.Node
-redraw domNode vNode = do
-    document <- documentForNode domNode
-    parentNode <- liftEff $ parentNode domNode
-    newNode <- render document vNode
+-- When Elm knows that there previously was a listener for an event, it does a
+-- kind of "mutate listener" instead of removing the listener and adding a new
+-- one. This might happen frequently, because testing the equality of decoders
+-- is not fully decidable. So, you may end up with a lot of spurious listener
+-- mutations. Removing and adding listeners is probably a little expensive, and
+-- could even affect behaviour in some cases. So, instead, Elm mutates the
+-- listener, by having the listener refer to some data "deposited" as a
+-- property on the DOM node. Thus, we can mutate the listener by changing that
+-- data.
 
-    -- We transfer a tagger from the old node to the new node, if there was
-    -- one, because taggers don't get their own node ... so we neeed to
-    -- preserve them when redrawing.
-    for_ (nodeToElement domNode) \oldElement ->
-        for_ (nodeToElement newNode) \newElement -> do
-            tagger <-
-                toMaybe <$> getTagger oldElement
 
-            for_ tagger (flip setTagger newElement)
+-- | The information that a handler needs (in addition to the event!)
+type HandlerInfo msg =
+    { decoder :: Decoder msg
+    , options :: Options
+    }
 
-    case parentNode of
-        Just p -> do
-            void $ liftEff $ replaceChild newNode domNode p
-            pure newNode
 
-        Nothing ->
-            pure newNode
+-- | The generic listener for any Elm event.
+-- |
+-- | The `HandlerInfo` is a `Ref` so that we can track it externally and mutate
+-- | it, without detaching and re-attaching the listener. Likewise the
+-- | `EventNodeRef` ...  we can mutate it without changing the various
+-- | listeners that might be using it. The Elm code achieves similar purposes,
+-- | though through different techniques.
+-- |
+-- | We'll have to see how these references play with garbage collection ...
+-- | hopefully it will be fine, but I should test it at some point to see
+-- | whether we end up diposing of things as expected when they are no longer
+-- | used.
+-- |
+-- | To actually create a listener that can be supplied to `addListener`, we
+-- | basically just partially apply the first two parameters.
+handleEvent :: ∀ msg. Ref (HandlerInfo msg) -> EventNodeRef msg -> Event -> IOSync Unit
+handleEvent handlerInfoRef eventNodeRef event = do
+    info <-
+        liftEff $ readRef handlerInfoRef
+
+    case decodeValue info.decoder $ toForeign event of
+        Err _ ->
+            -- Should we allow the client to do something with the error? Might
+            -- not be a bad idea.  However, failing the decoder at this stage
+            -- is a genuine strategy ... that way, you don't have to go through
+            -- an `update` round.  So, it's not as though this *necessarily*
+            -- represents a bug.
+            pure unit
+
+        Ok msg -> do
+            -- Perhaps curiously, the Elm code doesn't stopPropagation or
+            -- preventDefault unless the decoder succeeds ... so, we'll do that
+            -- as well.
+            when info.options.preventDefault $
+                liftEff $ preventDefault event
+
+            when info.options.stopPropagation $
+                liftEff $ stopPropagation event
+
+            -- Now, we run it through the event node.
+            runEventNode msg eventNodeRef
 
 
 -- | > Check out the docs for [`Html.App.program`][prog].
@@ -2194,6 +1605,7 @@ renderer view mailbox = liftAff do
 
             let newView = view newModel
 
+            {-
             newNode <-
                 case state of
                     Nothing -> do
@@ -2223,12 +1635,11 @@ renderer view mailbox = liftAff do
                         pure newNode
 
                     Just (oldView /\ oldNode) -> do
-                        void $ liftIOSync $
-                            applyPatches oldNode $ diff oldView newView
-
+                        -- liftIOSync $ update oldView newView oldNode
                         pure oldNode
+                -}
 
-            loop $ Just (newView /\ newNode)
+            loop $ Nothing -- Just (newView /\ newNode)
 
     void $ forkAff $ runIO' $ loop Nothing
 
@@ -2437,98 +1848,26 @@ function makeStepper(domNode, view, initialVirtualNode, eventNode)
 
 -}
 
+
 -- UTILITIES
-
-
-unsafeNodeToElement :: DOM.Node -> Element
-unsafeNodeToElement = unsafeCoerce
-
 
 -- Perhaps should suggest this for purescript-dom?
 nodeToElement :: DOM.Node -> Maybe Element
 nodeToElement n =
     unsafePartial
+        -- `nodeType` is marked `Partial`, because it uses `toEnum`, though
+        -- you'd think it could discharge the constraint ... perhaps I should
+        -- suggest that.
         case nodeType n of
             ElementNode ->
-                Just (unsafeNodeToElement n)
+                Just $ unsafeNodeToElement n
 
             _ ->
                 Nothing
 
-
--- | Like `DOM.Event.EventTarget.EventListener`, but parameterized by the `msg`
--- | type, and you can mutate the "info" that it uses without removing and
--- | adding the listener.
-foreign import data EventHandler :: Type -> Type
-
-
--- | Like `DOM.Event.EventTarget.eventListener`, but your function also gets
--- | some info of type `i`, and you can change that info without removing and
--- | re-applying the handler. And, since you can mutate the result, producing
--- | it needs to be an `Eff` itself.
--- |
--- | You have to supply some initial info (which you can change using
--- | `setHandlerInfo`).
-foreign import eventHandler :: ∀ i a.
-    (i -> Event -> IOSync a) -> i -> IOSync (EventHandler i)
-
-
--- | Like `addEventListener`, but for handlers. The `Boolean` arg indicates
--- | whether to use the "capture" phase.
-foreign import addEventHandler :: ∀ i.
-    EventType ->
-    EventHandler i ->
-    Boolean ->
-    EventTarget ->
-    IOSync Unit
-
-
--- | Supply a different value for the handler, for use with the callback
--- | function, without removing and re-applying the handler.
-foreign import setHandlerInfo :: ∀ i.
-    i -> EventHandler i -> IOSync Unit
-
-
--- | Like `removeEventListener`
-foreign import removeEventHandler :: ∀ i.
-    EventType ->
-    EventHandler i ->
-    Boolean ->
-    EventTarget ->
-    IOSync Unit
-
-
--- | It feels as though purescript-dom ought to have a way to do this, but I
--- | can't find it. Stores the `Foreign` in the `detail` field of the custom
--- | event.
-foreign import makeCustomEvent :: EventType -> Foreign -> IOSync CustomEvent
-
-
-eventToCustomEvent :: Event -> Maybe CustomEvent
-eventToCustomEvent = hush <<< runExcept <<< readCustomEvent <<< toForeign
-
-
-foreign import _detail :: CustomEvent -> Nullable Foreign
-
-
-detail :: CustomEvent -> Maybe Foreign
-detail = toMaybe <<< _detail
-
-
-nextEventTarget :: DOM.Node -> IOSync (Maybe EventTarget)
-nextEventTarget =
-    tailRecM \n ->
-        liftEff $ parentNode n >>= case _ of
-            Just parent ->
-                case runExcept $ readEventTarget $ toForeign parent of
-                    Right eventTarget ->
-                        pure $ Done $ Just eventTarget
-
-                    Left _ ->
-                        pure $ Loop parent
-
-            Nothing ->
-                pure $ Done $ Nothing
+    where
+        unsafeNodeToElement :: DOM.Node -> Element
+        unsafeNodeToElement = unsafeCoerce
 
 
 -- Set arbitrary property. TODO: Should suggest for purescript-dom
