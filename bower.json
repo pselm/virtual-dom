@@ -1,10 +1,10 @@
 {
-  "name": "purescript-elm",
-  "homepage": "https://github.com/rgrempel/purescript-elm",
+  "name": "purescript-pselm-virtual-dom",
+  "homepage": "https://github.com/pselm/virtual-dom",
   "authors": [
     "Ryan Rempel <rgrempel@gmail.com>"
   ],
-  "description": "Elm libraries in Purescript",
+  "description": "Purescript implementation of Elm's virtual DOM",
   "license": "MIT",
   "keywords": [
     "purescript"
@@ -16,17 +16,9 @@
     "output"
   ],
   "dependencies": {
-    "purescript-arrays": "^4.0.0",
-    "purescript-canvas": "^3.0.0",
-    "purescript-colors": "^4.0.0",
     "purescript-dom": "^4.0.0",
     "purescript-exists": "^3.0.0",
-    "purescript-format": "^3.0.0",
-    "purescript-js-timers": "^3.0.0",
     "purescript-lazy": "^3.0.0",
-    "purescript-list-zipper": "soupi/purescript-list-zipper#^1.0.0",
-    "purescript-now": "^3.0.0",
-    "purescript-nullable": "^3.0.0",
     "purescript-prelude": "^3.0.0",
     "purescript-refs": "^3.0.0",
     "purescript-unsafe-coerce": "^3.0.0",
@@ -35,11 +27,10 @@
   },
   "devDependencies": {
     "purescript-test-unit": "^13.0.0",
-    "purescript-psci-support": "^3.0.0",
     "purescript-jsdom": "rgrempel/purescript-jsdom#^1.0.0"
   },
   "repository": {
     "type": "git",
-    "url": "git://github.com/rgrempel/purescript-elm.git"
+    "url": "git://github.com/pselm/virtual-dom.git"
   }
 }
