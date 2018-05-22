@@ -23,7 +23,7 @@
     "purescript-refs": "^3.0.0",
     "purescript-unsafe-coerce": "^3.0.0",
     "purescript-unsafe-reference": "^2.0.0",
-    "purescript-pselm-core": "pselm/core#^4.0.3"
+    "purescript-pselm-core": "pselm/core#^4.0.4"
   },
   "devDependencies": {
     "purescript-test-unit": "^13.0.0",
